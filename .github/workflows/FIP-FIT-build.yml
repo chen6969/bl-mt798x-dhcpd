@@ -236,43 +236,15 @@ jobs:
           BOARD="${CONFIG#*_}"
           export BOARD="${BOARD%_*}"
 
-          # 逻辑版本：2022 / 2023 / 2024 / 2025
-          export LOGIC_VERSION="${{ matrix.version }}"
-
-          # 这里也可以直接映射出具体的 ATF / UBOOT 版本传给 build.sh
-          case "$LOGIC_VERSION" in
-            2022)
-              export ATF_VERSION="20220606-637ba581b"
-              export UBOOT_VERSION="20220606"
-              ;;
-            2023)
-              export ATF_VERSION="20231013-0ea67d76a"
-              export UBOOT_VERSION="20230718-09eda825"
-              ;;
-            2024)
-              export ATF_VERSION="20240117-bacca82a8"
-              export UBOOT_VERSION="20230718-09eda825"
-              ;;
-            2025)
-              export ATF_VERSION="20250711"
-              export UBOOT_VERSION="20250711"
-              ;;
-            *)
-              echo "Unknown LOGIC_VERSION=$LOGIC_VERSION" >&2
-              exit 1
-              ;;
-          esac
+          # 逻辑版本：2022 / 2023 / 2024 / 2025，直接映射到 build.sh 的 VERSION
+          export VERSION="${{ matrix.version }}"
 
           mkdir -p "output"
-          echo "Building SOC=$SOC BOARD=$BOARD LOGIC_VERSION=$LOGIC_VERSION ATF=$ATF_VERSION UBOOT=$UBOOT_VERSION"
+          echo "Building SOC=$SOC BOARD=$BOARD VERSION=$VERSION"
 
-          SOC="$SOC" BOARD="$BOARD" \
-          LOGIC_VERSION="$LOGIC_VERSION" \
-          ATF_VERSION="$ATF_VERSION" \
-          UBOOT_VERSION="$UBOOT_VERSION" \
-          ./build.sh 2>&1 | tee "output/build.log"
+          SOC="$SOC" BOARD="$BOARD" VERSION="$VERSION" ./build.sh 2>&1 | tee "output/build.log"
 
-          echo "ARTIFACT_NAME=$SOC-$BOARD-${LOGIC_VERSION}" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=$SOC-$BOARD-${VERSION}" >> "$GITHUB_ENV"
 
       - name: Organize and rename outputs
         run: |
