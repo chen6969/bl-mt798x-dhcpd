@@ -105,12 +105,18 @@ jobs:
           TARGET_RAW="${TARGET_RAW:-all}"
           TARGET="$(echo "$TARGET_RAW" | tr -d '[:space:]')"
 
+          # ✅ 修复：矩阵生成函数增加去重逻辑，避免重复构建项
           make_matrix_items() {
             local defconfigs="$1"
             local items=""
+            local added=()
             for def in $defconfigs; do
               for v in $versions; do
-                items="${items}{\"defconfig\":\"${def}\",\"version\":\"${v}\"},"
+                local key="${def}_${v}"
+                if [[ ! " ${added[@]} " =~ " ${key} " ]]; then
+                  items="${items}{\"defconfig\":\"${def}\",\"version\":\"${v}\"},"
+                  added+=("$key")
+                fi
               done
             done
             items="${items%,}"
@@ -242,7 +248,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ✅ 精准解析 SOC & BOARD
+          # ✅ 精准解析 SOC & BOARD (适配多下划线defconfig)
           export SOC=$(echo "${CONFIG}" | awk -F '_' '{print $1}')
           export BOARD=$(echo "${CONFIG}" | sed -e 's/^[^_]*_//' -e 's/_defconfig$//')
           export VERSION="${{ matrix.version }}"
@@ -257,10 +263,11 @@ jobs:
           echo "========================================"
           echo "Building SOC=$SOC BOARD=$BOARD VERSION=$VERSION"
 
-          # ✅ 修复权限 + 修复传参问题
+          # ✅ 修复build.sh执行权限 + 修复VERSION传参空值问题
           chmod +x ./build.sh && ./build.sh 2>&1 | tee "output/build.log"
 
-          echo "ARTIFACT_NAME=$SOC-$BOARD-${VERSION}" >> "$GITHUB_ENV"
+          # ✅ 核心修复409冲突：追加matrix.defconfig生成绝对唯一的Artifact名称，无任何重复可能
+          echo "ARTIFACT_NAME=$SOC-$BOARD-${VERSION}-${{ matrix.defconfig }}" >> "$GITHUB_ENV"
 
       - name: Upload build log on failure
         if: ${{ failure() }}
