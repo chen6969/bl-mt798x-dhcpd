@@ -18,6 +18,11 @@ on:
         required: false
         default: 'false'
         type: string
+      UBOOT_VERSION:
+        description: 'U-Boot version (e.g. 2022, 2023, 2025)'
+        required: false
+        default: '2022'
+        type: string
 
 env:
   TZ: Asia/Shanghai
@@ -194,10 +199,11 @@ jobs:
           export SOC="${CONFIG%%_*}"
           BOARD="${CONFIG#*_}"
           export BOARD="${BOARD%_*}"
-          export VERSION="2022"
+          # 这里从 workflow 输入获取 U-Boot 版本，默认 2022
+          export VERSION="${{ github.event.inputs.UBOOT_VERSION || '2022' }}"
           mkdir -p "output"
           SOC="$SOC" BOARD="$BOARD" VERSION="$VERSION" ./build.sh 2>&1 | tee "output/build.log"
-          echo "ARTIFACT_NAME=$SOC-$BOARD" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=$SOC-$BOARD-uboot$VERSION" >> "$GITHUB_ENV"
 
       - name: Organize and rename outputs
         run: |
@@ -259,6 +265,7 @@ jobs:
           touch release.txt
 
           echo "- 构建目标（TARGET）：${{ github.event.inputs.TARGET }}" >> release.txt
+          echo "- U-Boot 版本：${{ github.event.inputs.UBOOT_VERSION }}" >> release.txt
 
           CUSTOM_IP="${{ github.event.inputs.CUSTOM_IP }}"
           if [ "$CUSTOM_IP" != "false" ] && [ -n "$CUSTOM_IP" ]; then
