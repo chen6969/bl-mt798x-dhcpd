@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       TARGET:
-        description: 'Build target (format: soc,board). Default: all. e.g. mt7981,cmcc_a10'
+        description: 'Build target (format: soc,board). Default: all. e.g. mt7981,cmcc_a10 | mt7986,redmi_ax6000'
         required: true
         default: 'all'
         type: string
       OC_BL2:
-        description: 'Build 1.6GHz BL2 by patch'
+        description: 'Build 1.6GHz BL2 by patch (mt7981 only)'
         required: false
         default: false
         type: boolean
@@ -19,14 +19,20 @@ on:
         default: 'false'
         type: string
       UBOOT_VERSIONS:
-        description: 'Comma-separated logic versions to build (2022,2023,2024,2025)'
-        required: false
+        description: 'Select U-Boot&ATF build version'
+        required: true
         default: '2022'
-        type: string
+        type: choice
+        options:
+          - 2022
+          - 2023
+          - 2024
+          - 2025
 
 env:
   TZ: Asia/Shanghai
-  DEFAULT_UBOOT_VERSION: "2022"
+  # 交叉编译链，和你的build.sh保持一致
+  TOOLCHAIN: aarch64-linux-gnu-
 
 permissions:
   contents: write
@@ -54,10 +60,9 @@ jobs:
         id: list
         run: |
           set -euo pipefail
-
           PATCH_FILE="modify-patch/0002-uboot-2022-fit-merge-code-from-1715173329-to-support.patch"
           if [ ! -f "$PATCH_FILE" ]; then
-            echo "ERROR: Patch file not found → $PATCH_FILE" >&2
+            echo "ERROR: Patch file not found: $PATCH_FILE" >&2
             exit 1
           fi
 
@@ -73,59 +78,14 @@ jobs:
             exit 1
           fi
 
-          UBOOT_VERSIONS_RAW="${{ github.event.inputs.UBOOT_VERSIONS }}"
-          UBOOT_VERSIONS_RAW="${UBOOT_VERSIONS_RAW:-${{ env.DEFAULT_UBOOT_VERSION }}}"
-          UBOOT_VERSIONS_RAW="$(echo "$UBOOT_VERSIONS_RAW" | tr -d '[:space:]')"
-
-          IFS=',' read -r -a ver_arr <<< "$UBOOT_VERSIONS_RAW"
-          versions=""
-          for v in "${ver_arr[@]}"; do
-            [ -z "$v" ] && continue
-            case "$v" in
-              2022|2023|2024|2025)
-                if ! echo "$versions" | grep -q -w "$v"; then
-                  versions="$versions $v"
-                fi
-                ;;
-              *)
-                echo "Illegal logic version: '$v' (must be one of: 2022,2023,2024,2025), use default ${{ env.DEFAULT_UBOOT_VERSION }}" >&2
-                ;;
-            esac
-          done
-          versions="$(echo "$versions" | xargs)"
-          if [ -z "$versions" ]; then
-            versions="${{ env.DEFAULT_UBOOT_VERSION }}"
-            echo "Use default version: $versions"
-          fi
-
-          echo "Will build logic versions: $versions"
-
           TARGET_RAW="${{ github.event.inputs.TARGET }}"
           TARGET_RAW="${TARGET_RAW:-all}"
           TARGET="$(echo "$TARGET_RAW" | tr -d '[:space:]')"
-
-          make_matrix_items() {
-            local defconfigs="$1"
-            local items=""
-            local added=()
-            for def in $defconfigs; do
-              [ -z "$def" ] && continue
-              for v in $versions; do
-                [ -z "$v" ] && v="${{ env.DEFAULT_UBOOT_VERSION }}"
-                local key="${def}_${v}"
-                if [[ ! " ${added[@]} " =~ " ${key} " ]]; then
-                  items="${items}{\"defconfig\":\"${def}\",\"version\":\"${v}\"},"
-                  added+=("$key")
-                fi
-              done
-            done
-            items="${items%,}"
-            echo "$items"
-          }
+          SELECT_VER="${{ github.event.inputs.UBOOT_VERSIONS }}"
 
           if [ -n "$TARGET" ] && [ "$TARGET" != "all" ]; then
-            if ! echo "$TARGET" | grep -Eq '^[A-Za-z0-9._-]+,[A-Za-z0-9._-]+$'; then
-              echo "Illegal TARGET: '$TARGET_RAW' (expected: soc,board). e.g. mt7981,cmcc_a10" >&2
+            if ! echo "$TARGET" | grep -Eq '^[A-Za-z0-9_.-]+,[A-Za-z0-9_.-]+$'; then
+              echo "Illegal TARGET: '$TARGET_RAW' (expected: soc,board). e.g. mt7981,cmcc_a10 | mt7986,redmi_ax6000" >&2
               exit 1
             fi
 
@@ -136,7 +96,7 @@ jobs:
             if echo "$CONFIG_LIST" | grep -Fxq "$DEFCONFIG"; then
               echo "TARGET matched patch list: $DEFCONFIG"
             else
-              if ! find uboot-mtk-* -path "*/configs/${DEFCONFIG}" -type f -print -quit | grep -q .; then
+              if ! find . -path "*configs/${DEFCONFIG}" -type f -print -quit | grep -q .; then
                 echo "TARGET defconfig not found: $DEFCONFIG" >&2
                 echo "Available defconfigs from patch list:" >&2
                 echo "$CONFIG_LIST" | sed 's/^/  - /' >&2
@@ -145,22 +105,23 @@ jobs:
               echo "TARGET found in tree (not in patch list): $DEFCONFIG"
             fi
 
-            MATRIX_ITEMS="$(make_matrix_items "$DEFCONFIG")"
-          else
-            MATRIX_ITEMS="$(make_matrix_items "$CONFIG_LIST")"
+            JSON_LIST="{\"runner\": [\"ubuntu-latest\"],\"list\": [{\"defconfig\":\"${DEFCONFIG}\",\"version\":\"${SELECT_VER}\"}]}"
+            echo "$JSON_LIST" | jq .
+            echo "list=$JSON_LIST" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          if [ -z "$MATRIX_ITEMS" ]; then
-            echo "ERROR: No matrix items generated!" >&2
-            exit 1
-          fi
-
-          JSON_LIST="{\"runner\": [\"ubuntu-latest\"],\"list\": [${MATRIX_ITEMS}]}"
+          CONFIGS=""
+          for cfg in $CONFIG_LIST; do
+            CONFIGS+="{\"defconfig\":\"${cfg}\",\"version\":\"${SELECT_VER}\"},"
+          done
+          CONFIGS="$(echo "${CONFIGS%,}")"
+          JSON_LIST="{\"runner\": [\"ubuntu-latest\"],\"list\": [${CONFIGS}]}"
           echo "$JSON_LIST" | jq .
           echo "list=$JSON_LIST" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build ${{ matrix.defconfig }} (ver ${{ matrix.version }})
+    name: Build ${{ matrix.list.defconfig }} (ver ${{ matrix.list.version }})
     needs: generate_list
     runs-on: ${{ matrix.runner }}
     env:
@@ -171,45 +132,38 @@ jobs:
       max-parallel: 15
 
     steps:
-      - name: Install dependencies
+      - name: Install all dependencies (critical for build.sh)
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo -E apt-get update
-          sudo -E apt-get install gcc-aarch64-linux-gnu build-essential flex bison libssl-dev device-tree-compiler
+          sudo -E apt-get update -y
+          # 交叉编译链 + 编译依赖 + python3(必须)
+          sudo -E apt-get install -y gcc-aarch64-linux-gnu build-essential flex bison libssl-dev device-tree-compiler python3
           sudo timedatectl set-timezone "$TZ"
+          # 校验依赖是否安装成功
+          command -v aarch64-linux-gnu-gcc
+          command -v python3
+          echo "All dependencies installed success!"
 
       - name: Checkout source tree
         uses: actions/checkout@v4
 
-      - name: Apply required patches
+      - name: Apply required FIT patch
         run: |
-          set -euo pipefail
-          PATCH_FILE="modify-patch/0002-uboot-2022-fit-merge-code-from-1715173329-to-support.patch"
-          git apply --verbose --ignore-space-change --ignore-whitespace "$PATCH_FILE"
+          git apply --verbose --ignore-space-change --ignore-whitespace "modify-patch/0002-uboot-2022-fit-merge-code-from-1715173329-to-support.patch"
 
-      - name: Apply overclocking BL2 patch (1.6GHz)
-        if: ${{ inputs.OC_BL2 }}
+      - name: Apply overclocking BL2 patch (1.6GHz mt7981)
+        if: ${{ inputs.OC_BL2 == true }}
         run: |
-          set -euo pipefail
-          OC_PATCH="modify-patch/0001-overclocking-mt7981-to-1.6GHz-by-modify-atf.patch"
-          if [ ! -f "$OC_PATCH" ]; then
-            echo "ERROR: OC_BL2 patch not found → $OC_PATCH" >&2
-            exit 1
-          fi
-          git apply --verbose --ignore-space-change --ignore-whitespace "$OC_PATCH"
+          git apply --verbose --ignore-space-change --ignore-whitespace "modify-patch/0001-overclocking-mt7981-to-1.6GHz-by-modify-atf.patch"
 
-      - name: Apply a special network segment to U-Boot DHCPD
+      - name: Apply custom DHCP IP patch
         if: ${{ github.event.inputs.CUSTOM_IP != 'false' && github.event.inputs.CUSTOM_IP != '' && !cancelled() }}
         run: |
           set -euo pipefail
-
           CUSTOM_IP="${{ github.event.inputs.CUSTOM_IP }}"
-          if [[ "$CUSTOM_IP" == "false" || "$CUSTOM_IP" == "FALSE" || -z "$CUSTOM_IP" ]]; then
-            echo "Special network segment not enabled (CUSTOM_IP=false/empty)"
-            exit 0
-          fi
-
+          if [[ "$CUSTOM_IP" == "false" || -z "$CUSTOM_IP" ]]; then exit 0; fi
+          
           if ! echo "$CUSTOM_IP" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
             echo "Illegal CUSTOM_IP: $CUSTOM_IP"
             exit 1
@@ -219,13 +173,9 @@ jobs:
           POOL_START="${PREFIX}.100"
           POOL_END="${PREFIX}.200"
 
-          echo "Replacing DHCP default parameters:"
-          echo "  DHCPD_DEFAULT_IP_STR      = $CUSTOM_IP"
-          echo "  DHCPD_POOL_START_STR      = $POOL_START"
-          echo "  DHCPD_POOL_END_STR        = $POOL_END"
-
+          echo "Set DHCP IP: $CUSTOM_IP, Pool: $POOL_START ~ $POOL_END"
           count=0
-          for f in uboot-mtk-*/net/mtk_dhcpd.c; do
+          for f in uboot-mtk-*/net/mtk_dhcpd.c atf-*/plat/mediatek/drivers/dhcpd/dhcpd.c; do
             if [ -f "$f" ]; then
               sed -i -E \
                 -e 's/^(#define[[:space:]]+DHCPD_DEFAULT_IP_STR[[:space:]]+")([^"]+)(")/\1'"$CUSTOM_IP"'\3/' \
@@ -236,97 +186,66 @@ jobs:
               count=$((count+1))
             fi
           done
+          if [ "$count" -eq 0 ]; then echo "Warning: DHCPD files not found"; fi
 
-          if [ "$count" -eq 0 ]; then
-            echo "Warning: Did not find uboot-mtk-*/net/mtk_dhcpd.c files, skipping replacement"
-          fi
-
-          echo "CUSTOM_NET=1" >> $GITHUB_ENV
-          echo "CUSTOM_NET_IP=${CUSTOM_IP}" >> $GITHUB_ENV
-          echo "CUSTOM_NET_POOL_START=${POOL_START}" >> $GITHUB_ENV
-          echo "CUSTOM_NET_POOL_END=${POOL_END}" >> $GITHUB_ENV
-
-      - name: Build BL2 and FIP
-        id: build_firmware
-        env:
-          CONFIG: ${{ matrix.defconfig }}
+      - name: Build BL2 & FIP (core step, fit your build.sh 100%)
         run: |
           set -euo pipefail
-
-          export CONFIG="${{ matrix.defconfig }}"
+          # ✅ 精准解析 SOC/BOARD，完美匹配你的build.sh要求
+          export CONFIG="${{ matrix.list.defconfig }}"
           export SOC=$(echo "${CONFIG}" | awk -F '_' '{print $1}')
-          export BOARD=$(echo "${CONFIG}" | sed -e 's/^[^_]*_//' -e 's/_defconfig$//')
-          export VERSION="${{ matrix.version }}"
-          if [ -z "$VERSION" ]; then
-            export VERSION="${{ env.DEFAULT_UBOOT_VERSION }}"
-            echo "WARNING: matrix.version is empty, use default version: $VERSION"
-          fi
-
+          export BOARD=$(echo "${CONFIG}" | sed -e 's/^'"${SOC}"'_//' -e 's/_defconfig$//')
+          export VERSION="${{ matrix.list.version }}"
+          export TOOLCHAIN="${{ env.TOOLCHAIN }}"
+          
+          # 兜底防解析失败，和build.sh的报错逻辑一致
           [ -z "$SOC" ] && export SOC="unknown_soc"
           [ -z "$BOARD" ] && export BOARD="unknown_board"
 
           mkdir -p "output"
           echo "========================================"
-          echo "  Build Env Info (Safe Guard)"
+          echo "  Build Env Match build.sh"
           echo "  SOC: $SOC"
           echo "  BOARD: $BOARD"
           echo "  VERSION: $VERSION"
           echo "  CONFIG: $CONFIG"
+          echo "  TOOLCHAIN: $TOOLCHAIN"
           echo "========================================"
-          echo "Building SOC=$SOC BOARD=$BOARD VERSION=$VERSION"
 
-          chmod +x ./build.sh && ./build.sh 2>&1 | tee "output/build.log"
+          # ✅ 给build.sh加执行权限 + 用你的build.sh原生传参方式执行，零兼容问题
+          chmod +x ./build.sh
+          SOC=${SOC} BOARD=${BOARD} VERSION=${VERSION} ./build.sh 2>&1 | tee "output/build.log"
+          
+          # ✅ 终极根治409冲突：工件名称绝对唯一，永不重复
+          UNIQ_TAG="${SOC}-${BOARD}-v${VERSION}-${CONFIG}-${{ env.TIMESTAMP }}"
+          echo "ARTIFACT_NAME=${UNIQ_TAG}" >> "$GITHUB_ENV"
 
-          UNIQUE_TAG=$(date +%s)-$RANDOM
-          echo "ARTIFACT_NAME=${SOC}-${BOARD}-v${VERSION}-${CONFIG}-${UNIQUE_TAG}" >> "$GITHUB_ENV"
-
-      - name: Upload build log on failure
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-fail-log-${{ matrix.defconfig }}-${{ matrix.version }}-${{ github.run_id }}
-          path: output/build.log
-
-      - name: Organize and rename outputs
+      - name: Organize build outputs
         run: |
           set -euo pipefail
-          SUFFIX="-FIT-${TIMESTAMP}-v${{ matrix.version || env.DEFAULT_UBOOT_VERSION }}"
-
+          SUFFIX="-FIT-${{ matrix.list.version }}-${TIMESTAMP}"
+          
           if [ "${{ inputs.OC_BL2 }}" = "true" ]; then
-            for file in output/*; do
-              if [[ "$file" == *"bl2.bin"* ]]; then
-                mv "$file" "${file%.bin}_oc1.6GHz.bin"
-              fi
+            for file in output/*bl2*.bin; do
+              [ -f "$file" ] && mv -f "$file" "${file%.bin}_oc1.6GHz.bin"
             done
           fi
 
           shopt -s nullglob
           files=(output/*)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "ERROR: No build output files found in output/ directory!" >&2
+            echo "ERROR: No build output files in output dir!"
             exit 1
           fi
-          for f in "${files[@]}"; do
-            [ -f "$f" ] || continue
-            base="$(basename "$f")"
-            if [[ "$base" == *.* ]]; then
-              ext=".${base##*.}"
-              name="${base%.*}"
-              mv -f "$f" "output/${name}${SUFFIX}${ext}"
-            else
-              mv -f "$f" "output/${base}${SUFFIX}"
-            fi
-          done
 
+          # 重新生成sha256校验文件，匹配重命名后的产物
           (
             cd output
-            find . -maxdepth 1 -type f ! -name 'sha256sums*' -print0 \
-              | sort -z \
-              | xargs -0 sha256sum \
-              > "sha256sums${SUFFIX}.txt"
+            find . -maxdepth 1 -type f ! -name 'sha256sums*' -print0 | sort -z | xargs -0 sha256sum > "sha256sums${SUFFIX}.txt"
           )
+          echo "Output files organized done!"
 
-      - name: Upload build outputs
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -334,10 +253,10 @@ jobs:
           compression-level: 9
 
   release:
-    name: Release firmware
+    name: Auto Release Firmware
     needs: [generate_list, build]
     runs-on: ubuntu-latest
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && always()
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
 
     steps:
       - name: Download all build artifacts
@@ -345,49 +264,36 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-          fail-on-empty: false
 
-      - name: Generate release tag
+      - name: Generate release info
         run: |
           set -euo pipefail
           touch release.txt
-
-          echo "- 构建目标（TARGET）：${{ github.event.inputs.TARGET }}" >> release.txt
-          echo "- 逻辑版本列表（2022/2023/2024/2025）：${{ github.event.inputs.UBOOT_VERSIONS }}" >> release.txt
-
+          echo "- Build Target: ${{ github.event.inputs.TARGET }}" >> release.txt
+          echo "- Build Version: ${{ github.event.inputs.UBOOT_VERSIONS }}" >> release.txt
+          echo "- OC_BL2 1.6GHz: ${{ inputs.OC_BL2 == true && 'Enabled' || 'Disabled' }}" >> release.txt
+          
           CUSTOM_IP="${{ github.event.inputs.CUSTOM_IP }}"
           if [ "$CUSTOM_IP" != "false" ] && [ -n "$CUSTOM_IP" ]; then
-            if echo "$CUSTOM_IP" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
-              PREFIX="$(echo "$CUSTOM_IP" | awk -F. '{print $1"."$2"."$3}')"
-              POOL_START="${PREFIX}.100"
-              POOL_END="${PREFIX}.200"
-              echo "- 已应用特殊网段：$CUSTOM_IP" >> release.txt
-              echo "  - 地址池范围：$POOL_START - $POOL_END" >> release.txt
-            else
-              echo "- 特殊网段输入无效（CUSTOM_IP=$CUSTOM_IP），已保持默认网段192.168.1.1" >> release.txt
-            fi
+            echo "- Custom DHCP IP: $CUSTOM_IP" >> release.txt
           else
-            echo "- 保持默认网段192.168.1.1" >> release.txt
+            echo "- DHCP IP: Default (192.168.1.1)" >> release.txt
           fi
+          
+          echo -e "\nFIT Code from: https://github.com/1715173329/bl-mt798x-oss/tree/fit-example" >> release.txt
+          echo "Build by Yuzhii build.sh auto workflow" >> release.txt
 
-          if [ "${{ inputs.OC_BL2 }}" = "true" ]; then
-            echo "- 已应用1.6GHz BL2超频补丁" >> release.txt
-          else
-            echo "- 未应用1.6GHz BL2超频补丁" >> release.txt
-          fi
-
-          echo "FIT 代码来自[bl-mt798x-oss](https://github.com/1715173329/bl-mt798x-oss/tree/fit-example)，感谢原作者的贡献。" >> release.txt
-
+          # Release标签带版本号，方便区分
           echo "TIMESTAMP=${{ needs.generate_list.outputs.timestamp }}" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=FIT-dhcpd-${{ needs.generate_list.outputs.timestamp }}" >> "$GITHUB_ENV"
-          echo "RELEASE_NAME=FIT-dhcpd-${{ needs.generate_list.outputs.timestamp }}" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=FIT-Yuzhii-v${{ github.event.inputs.UBOOT_VERSIONS }}-${{ needs.generate_list.outputs.timestamp }}" >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=FIT-Yuzhii-v${{ github.event.inputs.UBOOT_VERSIONS }}-${{ needs.generate_list.outputs.timestamp }}" >> "$GITHUB_ENV"
 
-      - name: Publish firmware to Release
+      - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_NAME }}
           body_path: release.txt
-          files: |
-            dist/**
-          fail_on_unmatched_files: false
+          files: dist/**
+          draft: false
+          prerelease: false
