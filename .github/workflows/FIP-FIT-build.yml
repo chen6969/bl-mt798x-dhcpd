@@ -18,8 +18,8 @@ on:
         required: false
         default: 'false'
         type: string
-      UBOOT_VERSION:
-        description: 'U-Boot version (e.g. 2022, 2023, 2025)'
+      UBOOT_VERSIONS:
+        description: 'Comma-separated logic versions to build (2022,2023,2024,2025)'
         required: false
         default: '2022'
         type: string
@@ -52,11 +52,12 @@ jobs:
       - name: Generate build list
         id: list
         run: |
+          set -euo pipefail
+
           PATCH_FILE="modify-patch/0002-uboot-2022-fit-merge-code-from-1715173329-to-support.patch"
           test -f "$PATCH_FILE"
 
-          # Extract defconfig filenames touched by the patch (unique, basename only).
-          # Expected diff line format: diff --git a/<path> b/<path>
+          # 提取补丁里改到的 defconfig
           CONFIG_LIST="$(
             awk '/^diff --git a\// {print $4}' "$PATCH_FILE" \
               | sed 's/^b\///' \
@@ -69,14 +70,53 @@ jobs:
             exit 1
           fi
 
-          # Optional: build only one target when inputs.TARGET is provided as soc,board
+          # 解析逻辑版本列表（2022,2023,2024,2025）
+          UBOOT_VERSIONS_RAW="${{ github.event.inputs.UBOOT_VERSIONS }}"
+          UBOOT_VERSIONS_RAW="${UBOOT_VERSIONS_RAW:-2022}"
+          UBOOT_VERSIONS_RAW="$(echo "$UBOOT_VERSIONS_RAW" | tr -d '[:space:]')"
+
+          IFS=',' read -r -a ver_arr <<< "$UBOOT_VERSIONS_RAW"
+          versions=""
+          for v in "${ver_arr[@]}"; do
+            [ -z "$v" ] && continue
+            case "$v" in
+              2022|2023|2024|2025)
+                if ! echo "$versions" | grep -q -w "$v"; then
+                  versions="$versions $v"
+                fi
+                ;;
+              *)
+                echo "Illegal logic version: '$v' (must be one of: 2022,2023,2024,2025)" >&2
+                exit 1
+                ;;
+            esac
+          done
+          versions="$(echo "$versions" | xargs)"
+
+          if [ -z "$versions" ]; then
+            echo "No valid versions parsed from: '$UBOOT_VERSIONS_RAW'" >&2
+            exit 1
+          fi
+
+          echo "Will build logic versions: $versions"
+
           TARGET_RAW="${{ github.event.inputs.TARGET }}"
           TARGET_RAW="${TARGET_RAW:-all}"
-          # Trim all whitespace so both "mt7981,cmcc_a10" and "mt7981, cmcc_a10" work.
           TARGET="$(echo "$TARGET_RAW" | tr -d '[:space:]')"
 
+          make_matrix_items() {
+            local defconfigs="$1"
+            local items=""
+            for def in $defconfigs; do
+              for v in $versions; do
+                items="${items}{\"defconfig\":\"${def}\",\"version\":\"${v}\"},"
+              done
+            done
+            items="${items%,}"
+            echo "$items"
+          }
+
           if [ -n "$TARGET" ] && [ "$TARGET" != "all" ]; then
-            # format: soc,board -> soc_board_defconfig
             if ! echo "$TARGET" | grep -Eq '^[A-Za-z0-9._-]+,[A-Za-z0-9._-]+$'; then
               echo "Illegal TARGET: '$TARGET_RAW' (expected: soc,board). e.g. mt7981,cmcc_a10" >&2
               exit 1
@@ -86,7 +126,6 @@ jobs:
             BOARD="${TARGET#*,}"
             DEFCONFIG="${SOC}_${BOARD}_defconfig"
 
-            # Prefer validating against patch-derived list; otherwise validate existence in tree.
             if echo "$CONFIG_LIST" | grep -Fxq "$DEFCONFIG"; then
               echo "TARGET matched patch list: $DEFCONFIG"
             else
@@ -99,20 +138,17 @@ jobs:
               echo "TARGET found in tree (not in patch list): $DEFCONFIG"
             fi
 
-            JSON_LIST="{\"runner\": [\"ubuntu-latest\"],\"list\": [\"${DEFCONFIG}\"]}"
-            echo "$JSON_LIST" | jq .
-            echo "list=$JSON_LIST" >> "$GITHUB_OUTPUT"
-            exit 0
+            MATRIX_ITEMS="$(make_matrix_items "$DEFCONFIG")"
+          else
+            MATRIX_ITEMS="$(make_matrix_items "$CONFIG_LIST")"
           fi
 
-          # Default: build all defconfigs extracted from patch.
-          CONFIGS="$(echo "$CONFIG_LIST" | awk '{printf "\"%s\",", $0}' | sed 's/,$//')"
-          JSON_LIST="{\"runner\": [\"ubuntu-latest\"],\"list\": [$CONFIGS]}"
+          JSON_LIST="{\"runner\": [\"ubuntu-latest\"],\"list\": [${MATRIX_ITEMS}]}"
           echo "$JSON_LIST" | jq .
           echo "list=$JSON_LIST" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build ${{ matrix.list }}
+    name: Build ${{ matrix.defconfig }} (ver ${{ matrix.version }})
     needs: generate_list
     runs-on: ${{ matrix.runner }}
     env:
@@ -154,7 +190,6 @@ jobs:
             exit 0
           fi
 
-          # Simple IPv4 validation (does not check the range of each segment)
           if ! echo "$CUSTOM_IP" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
             echo "Illegal CUSTOM_IP: $CUSTOM_IP"
             exit 1
@@ -190,25 +225,59 @@ jobs:
           echo "CUSTOM_NET_IP=${CUSTOM_IP}" >> $GITHUB_ENV
           echo "CUSTOM_NET_POOL_START=${POOL_START}" >> $GITHUB_ENV
           echo "CUSTOM_NET_POOL_END=${POOL_END}" >> $GITHUB_ENV
-          echo "status=success" >> $GITHUB_OUTPUT
 
       - name: Build BL2 and FIP
         env:
-          CONFIG: ${{ matrix.list }}
+          CONFIG: ${{ matrix.defconfig }}
         run: |
+          set -euo pipefail
+
           export SOC="${CONFIG%%_*}"
           BOARD="${CONFIG#*_}"
           export BOARD="${BOARD%_*}"
-          # 这里从 workflow 输入获取 U-Boot 版本，默认 2022
-          export VERSION="${{ github.event.inputs.UBOOT_VERSION || '2022' }}"
+
+          # 逻辑版本：2022 / 2023 / 2024 / 2025
+          export LOGIC_VERSION="${{ matrix.version }}"
+
+          # 这里也可以直接映射出具体的 ATF / UBOOT 版本传给 build.sh
+          case "$LOGIC_VERSION" in
+            2022)
+              export ATF_VERSION="20220606-637ba581b"
+              export UBOOT_VERSION="20220606"
+              ;;
+            2023)
+              export ATF_VERSION="20231013-0ea67d76a"
+              export UBOOT_VERSION="20230718-09eda825"
+              ;;
+            2024)
+              export ATF_VERSION="20240117-bacca82a8"
+              export UBOOT_VERSION="20230718-09eda825"
+              ;;
+            2025)
+              export ATF_VERSION="20250711"
+              export UBOOT_VERSION="20250711"
+              ;;
+            *)
+              echo "Unknown LOGIC_VERSION=$LOGIC_VERSION" >&2
+              exit 1
+              ;;
+          esac
+
           mkdir -p "output"
-          SOC="$SOC" BOARD="$BOARD" VERSION="$VERSION" ./build.sh 2>&1 | tee "output/build.log"
-          echo "ARTIFACT_NAME=$SOC-$BOARD-uboot$VERSION" >> "$GITHUB_ENV"
+          echo "Building SOC=$SOC BOARD=$BOARD LOGIC_VERSION=$LOGIC_VERSION ATF=$ATF_VERSION UBOOT=$UBOOT_VERSION"
+
+          SOC="$SOC" BOARD="$BOARD" \
+          LOGIC_VERSION="$LOGIC_VERSION" \
+          ATF_VERSION="$ATF_VERSION" \
+          UBOOT_VERSION="$UBOOT_VERSION" \
+          ./build.sh 2>&1 | tee "output/build.log"
+
+          echo "ARTIFACT_NAME=$SOC-$BOARD-${LOGIC_VERSION}" >> "$GITHUB_ENV"
 
       - name: Organize and rename outputs
         run: |
           set -euo pipefail
-          SUFFIX="-FIT-${TIMESTAMP}"
+          SUFFIX="-FIT-${TIMESTAMP}-v${{ matrix.version }}"
 
           if [ "${{ inputs.OC_BL2 }}" = "true" ]; then
             for file in output/*; do
@@ -231,7 +300,6 @@ jobs:
             fi
           done
 
-          # Re-generate sha256sums AFTER renaming; exclude sha256sums itself.
           (
             cd output
             find . -maxdepth 1 -type f ! -name 'sha256sums*' -print0 \
@@ -265,7 +333,7 @@ jobs:
           touch release.txt
 
           echo "- 构建目标（TARGET）：${{ github.event.inputs.TARGET }}" >> release.txt
-          echo "- U-Boot 版本：${{ github.event.inputs.UBOOT_VERSION }}" >> release.txt
+          echo "- 逻辑版本列表（2022/2023/2024/2025）：${{ github.event.inputs.UBOOT_VERSIONS }}" >> release.txt
 
           CUSTOM_IP="${{ github.event.inputs.CUSTOM_IP }}"
           if [ "$CUSTOM_IP" != "false" ] && [ -n "$CUSTOM_IP" ]; then
