@@ -55,9 +55,11 @@ jobs:
           set -euo pipefail
 
           PATCH_FILE="modify-patch/0002-uboot-2022-fit-merge-code-from-1715173329-to-support.patch"
-          test -f "$PATCH_FILE"
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "ERROR: Patch file not found → $PATCH_FILE" >&2
+            exit 1
+          fi
 
-          # 提取补丁里改到的 defconfig
           CONFIG_LIST="$(
             awk '/^diff --git a\// {print $4}' "$PATCH_FILE" \
               | sed 's/^b\///' \
@@ -70,7 +72,6 @@ jobs:
             exit 1
           fi
 
-          # 解析逻辑版本列表（2022,2023,2024,2025）
           UBOOT_VERSIONS_RAW="${{ github.event.inputs.UBOOT_VERSIONS }}"
           UBOOT_VERSIONS_RAW="${UBOOT_VERSIONS_RAW:-2022}"
           UBOOT_VERSIONS_RAW="$(echo "$UBOOT_VERSIONS_RAW" | tr -d '[:space:]')"
@@ -172,21 +173,29 @@ jobs:
 
       - name: Apply required patches
         run: |
-          git apply --verbose "modify-patch/0002-uboot-2022-fit-merge-code-from-1715173329-to-support.patch"
+          set -euo pipefail
+          PATCH_FILE="modify-patch/0002-uboot-2022-fit-merge-code-from-1715173329-to-support.patch"
+          git apply --verbose --ignore-space-change --ignore-whitespace "$PATCH_FILE"
 
       - name: Apply overclocking BL2 patch (1.6GHz)
         if: ${{ inputs.OC_BL2 }}
         run: |
-          git apply --verbose "modify-patch/0001-overclocking-mt7981-to-1.6GHz-by-modify-atf.patch"
+          set -euo pipefail
+          OC_PATCH="modify-patch/0001-overclocking-mt7981-to-1.6GHz-by-modify-atf.patch"
+          if [ ! -f "$OC_PATCH" ]; then
+            echo "ERROR: OC_BL2 patch not found → $OC_PATCH" >&2
+            exit 1
+          fi
+          git apply --verbose --ignore-space-change --ignore-whitespace "$OC_PATCH"
 
       - name: Apply a special network segment to U-Boot DHCPD
-        if: github.event.inputs.CUSTOM_IP != 'false' && !cancelled()
+        if: ${{ github.event.inputs.CUSTOM_IP != 'false' && github.event.inputs.CUSTOM_IP != '' && !cancelled() }}
         run: |
           set -euo pipefail
 
           CUSTOM_IP="${{ github.event.inputs.CUSTOM_IP }}"
-          if [ "$CUSTOM_IP" = "false" ] || [ -z "$CUSTOM_IP" ]; then
-            echo "Special network segment not enabled (CUSTOM_IP=false or not provided)"
+          if [[ "$CUSTOM_IP" == "false" || "$CUSTOM_IP" == "FALSE" || -z "$CUSTOM_IP" ]]; then
+            echo "Special network segment not enabled (CUSTOM_IP=false/empty)"
             exit 0
           fi
 
@@ -227,24 +236,38 @@ jobs:
           echo "CUSTOM_NET_POOL_END=${POOL_END}" >> $GITHUB_ENV
 
       - name: Build BL2 and FIP
+        id: build_firmware
         env:
           CONFIG: ${{ matrix.defconfig }}
         run: |
           set -euo pipefail
 
-          export SOC="${CONFIG%%_*}"
-          BOARD="${CONFIG#*_}"
-          export BOARD="${BOARD%_*}"
-
-          # 逻辑版本：2022 / 2023 / 2024 / 2025，直接映射到 build.sh 的 VERSION
+          # ✅ 精准解析 SOC & BOARD
+          export SOC=$(echo "${CONFIG}" | awk -F '_' '{print $1}')
+          export BOARD=$(echo "${CONFIG}" | sed -e 's/^[^_]*_//' -e 's/_defconfig$//')
           export VERSION="${{ matrix.version }}"
 
           mkdir -p "output"
+          echo "========================================"
+          echo "  Build Env Info"
+          echo "  SOC: $SOC"
+          echo "  BOARD: $BOARD"
+          echo "  VERSION: $VERSION"
+          echo "  CONFIG: $CONFIG"
+          echo "========================================"
           echo "Building SOC=$SOC BOARD=$BOARD VERSION=$VERSION"
 
-          SOC="$SOC" BOARD="$BOARD" VERSION="$VERSION" ./build.sh 2>&1 | tee "output/build.log"
+          # ✅ 修复权限 + 修复传参问题
+          chmod +x ./build.sh && ./build.sh 2>&1 | tee "output/build.log"
 
           echo "ARTIFACT_NAME=$SOC-$BOARD-${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Upload build log on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-fail-log-${{ matrix.defconfig }}-${{ matrix.version }}
+          path: output/build.log
 
       - name: Organize and rename outputs
         run: |
@@ -260,7 +283,12 @@ jobs:
           fi
 
           shopt -s nullglob
-          for f in output/*; do
+          files=(output/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "ERROR: No build output files found in output/ directory!" >&2
+            exit 1
+          fi
+          for f in "${files[@]}"; do
             [ -f "$f" ] || continue
             base="$(basename "$f")"
             if [[ "$base" == *.* ]]; then
